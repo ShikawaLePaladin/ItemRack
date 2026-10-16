@@ -1,4 +1,16 @@
 --[[ ItemRack 1.975 7/27/06 Gello ]]--
+--[[ Octo/Shikiwa patch 2026-10-14 (tests: C:Tempccxitemrack_work	ests_itemrack.lua). What changed, in short:
+  - items are matched by exact id, then by the same item with another ENCHANT (ids go stale when gear is re-enchanted), then by name
+    (Rack.SameItem / Rack.FindItem / Rack.FindSetItem); IsSetEquipped and EquipSet accept an item worn with another enchant
+  - Rack.GetItemInfo falls back on the name written in the link when GetItemInfo has nothing cached
+  - EquipSet can take items from the bank while the bank window is open; free-slot / lock handling covers the bank
+  - Rack.ShutdownQueue empties the whole queue (stale swaps of an abandoned set were replayed); a watchdog and a post-check
+    (Rack.FinishSet, at most 2 retries) replace the old "stuck swapping forever" / "half equipped set, no message"
+  - bank menu: no error on the (empty) entry, items tracked per slot/id instead of per name, pushing a set no longer strips
+    the worn gear, Ctrl+click equips normally while the bank is open, PLAYERBANKSLOTS_CHANGED refreshes the bank list
+  - menu clicks check the bag slot still holds the clicked item (bags can change while the menu is open)
+  - set names like "Racing" are no longer treated as internal "Rack-" sets ("Rack-" pattern, '-' was a quantifier)
+  Saved variables format is unchanged. Original: C:TempccxackupItemRack-pre-fix-20261014 ]]--
 
 --[[ SavedVariables ]]--
 
@@ -95,7 +107,9 @@ ItemRack.SelectedEvent = 0 -- index in list of event selected
 ItemRack.CanWearOneHandOffHand = nil -- whether player can wear one-hand in offhand (warrior, rogue, hunter)
 
 ItemRack.Buffs = {} -- table indexed by buff names, whether a buff is on or not
-ItemRack.BankedItems = {} -- items in the bank indexed by itemID
+ItemRack.BankedItems = {} -- items in the bank indexed by name (number of copies)
+ItemRack.BankedIDs = {} -- same, indexed by the exact id "ITEMID:ENCHANT:SUFFIX"
+ItemRack.BankedSame = {} -- same, indexed by "ITEMID:SUFFIX" (enchant ignored)
 ItemRack.BankSlots = { -1,5,6,7,8,9,10 }
 
 local eventList = {} -- note the departure from using the table for local values -- mod will be rewritten to a consistent style
@@ -469,7 +483,7 @@ local function get_item_info(bag,slot)
 		-- if querying set slot, return current set texture and name
 		name = Rack.CurrentSet()
 		texture = "Interface\\AddOns\\ItemRack\\ItemRack-Icon"
-		if name and Rack_User[user].Sets[name] and not string.find(name,"^ItemRack") and not string.find(name,"^Rack-") then
+		if name and Rack_User[user].Sets[name] and not string.find(name,"^ItemRack") and not string.find(name,"^Rack%-") then
 			texture = Rack_User[user].Sets[name].icon
 		else
 			name = nil
@@ -676,7 +690,7 @@ function ItemRack_BuildMenu(invslot,relativeTo)
 		-- this is a menu for sets
 		-- go through sets and gather them into .BaggedItems
 		for i in Rack_User[user].Sets do
-			if not string.find(i,"^ItemRack") and not string.find(i,"^Rack-") and (not Rack_User[user].Sets[i].hide or IsAltKeyDown()) then
+			if not string.find(i,"^ItemRack") and not string.find(i,"^Rack%-") and (not Rack_User[user].Sets[i].hide or IsAltKeyDown()) then
 				populate_baggeditems(idx,nil,nil,i,Rack_User[user].Sets[i].icon)
 				idx = idx + 1
 			end
@@ -795,7 +809,7 @@ function ItemRack_BuildMenu(invslot,relativeTo)
 				getglobal("ItemRackMenu"..i.."Count"):SetText("")
 				getglobal("ItemRackMenu"..i.."HotKey"):SetText("")
 
-				if ItemRack.BankedItems[ItemRack.BaggedItems[i].name] then
+				if Rack.IsBankBag(ItemRack.BaggedItems[i].bag) then
 					getglobal("ItemRackMenu"..i.."Border"):Show()
 					getglobal("ItemRackMenu"..i.."Icon"):SetVertexColor(.5,.5,.5)
 				else
@@ -1290,7 +1304,7 @@ function ItemRack_OnEvent(event)
 	elseif event=="BANKFRAME_CLOSED" then
 		Rack.BankClosed()
 
-	elseif event=="BAG_UPDATE" then -- only enabled when bank is open
+	elseif event=="BAG_UPDATE" or event=="PLAYERBANKSLOTS_CHANGED" then -- only enabled when bank is open
 		Rack.PopulateBank()
 		if ItemRack_MenuFrame:IsVisible() and ItemRack.InvOpen then
 			ItemRack_BuildMenu(ItemRack.InvOpen,ItemRack.MenuDockedTo)
@@ -1774,14 +1788,26 @@ function ItemRack_Menu_OnClick(arg1)
 
 	if SpellIsTargeting() or CursorHasItem() then return end -- prohibit swaps while in spell target/disenchant mode
 
-	if ItemRack.BankIsOpen then
+	if ItemRack.InvOpen and ItemRack.InvOpen~=20 and not Rack.CheckMenuItem(id) then
+		-- the bags changed since the menu was built and the clicked item is gone: show an up to date menu instead of
+		-- swapping whatever now sits in that bag slot
+		ItemRack_BuildMenu(ItemRack.InvOpen,ItemRack.MenuDockedTo)
+		return
+	end
+
+	-- bank open: a click moves the item/set between bags and bank (Ctrl+click = equip as usual)
+	if ItemRack.BankIsOpen and not IsControlKeyDown() then
 		if ItemRack.InvOpen~=20 then
 			Rack.ClearLockList()
 			local bag,slot
-			if ItemRack.BankedItems[name] then
+			local fromBag,fromSlot = ItemRack.BaggedItems[id].bag,ItemRack.BaggedItems[id].slot
+			if not fromBag then
+				-- the "(empty)" entry has no item to move (it used to call PickupContainerItem(nil,nil) = error)
+			elseif Rack.IsBankBag(fromBag) then
+				-- item is in the bank: bring it to the bags
 				bag,slot = Rack.FindSpace()
 				if bag then
-					PickupContainerItem(ItemRack.BaggedItems[id].bag,ItemRack.BaggedItems[id].slot)
+					PickupContainerItem(fromBag,fromSlot)
 					PickupContainerItem(bag,slot)
 				else
 					Rack.NoMoreRoom()
@@ -1789,7 +1815,7 @@ function ItemRack_Menu_OnClick(arg1)
 			else
 				bag,slot = Rack.FindSpace(1)
 				if bag then
-					PickupContainerItem(ItemRack.BaggedItems[id].bag,ItemRack.BaggedItems[id].slot)
+					PickupContainerItem(fromBag,fromSlot)
 					PickupContainerItem(bag,slot)
 				else
 					Rack.NoMoreRoom()
@@ -2752,7 +2778,7 @@ function ItemRack_Sets_Build_Dropdown()
 	ItemRack.SetsList = ItemRack.SetsList or {}
 
 	for i in Rack_User[user].Sets do
-		if not string.find(i,"^ItemRack-") and not string.find(i,"^Rack-") then -- skip special sets (ItemRack-Queue and ItemRack-Normal)
+		if not string.find(i,"^ItemRack%-") and not string.find(i,"^Rack%-") then -- skip special sets (ItemRack-Queue and ItemRack-Normal)
 			count = 0
 			ItemRack.SetsList[idx] = ItemRack.SetsList[idx] or {}
 			ItemRack.SetsList[idx].Icon = Rack_User[user].Sets[i].icon
@@ -2858,8 +2884,8 @@ function ItemRack_Sets_Tooltip(setname,show_contents)
 			if Rack_User[user].Sets[setname][i] then
 				name = Rack_User[user].Sets[setname][i].name or "(empty)"
 				count = count + 1
-				inv,bag = Rack.FindItem(nil,name,"passive")
-				if ItemRack.BankedItems[name] then
+				inv,bag = Rack.FindItem(Rack_User[user].Sets[setname][i].id,name,"passive")
+				if Rack.IsBanked(Rack_User[user].Sets[setname][i]) and not (inv or bag) then
 					r,g,b = .3,.5,1
 				elseif inv or bag or name=="(empty)" then
 					r,g,b = .85,.85,.85
@@ -3861,7 +3887,9 @@ Rack = {
 	SwapList = {}, -- individual item swap details go here
 	LockList = {}, -- tables of bags where slots are locked (to be skipped in FindItem and FindSpace)
 	CombatQueue = {}, -- table of items to swap in when dropping out of combat/death
-	UseQueue = {} -- table of items to be swapped after the slot is used
+	UseQueue = {}, -- table of items to be swapped after the slot is used
+	Planned = {}, -- [setname] = { [slot]=1 } slots EquipSet really tried to change (checked by FinishSet)
+	RetryCount = {} -- [setname] = number of automatic retries already done
 }
 
 Rack.SlotInfo = {
@@ -3918,6 +3946,8 @@ function Rack.Initialize()
 	Rack.CreateTimer("MenuFrame",Rack.MenuFrame,.25,1) -- menu mouseover check
 	Rack.CreateTimer("InvUpdate",ItemRack_InvUpdate_OnUpdate,.25,1) -- inventory throttle
 	Rack.CreateTimer("UseQueue",Rack.OnEvent,.25,0,arg)
+	Rack.CreateTimer("SwapWatchdog",Rack.SwapWatchdog,1.5,1) -- unsticks a swap queue that never gets its lock event
+	Rack.CreateTimer("RetrySet",Rack.RetrySet,.6) -- second attempt at the slots that did not change
 end
 
 function Rack.OnEvent(overrideslot)
@@ -3968,9 +3998,20 @@ function Rack.GetItemInfo(bag,slot)
 	end
 
 	if itemLink then
-		_,_,id = string.find(itemLink,"(item:%d+:%d+:%d+:%d+)")
-		_,_,itemID = string.find(id or "","item:(%d+:%d+:%d+):%d+")
-		itemName,_,_,_,_,_,_,itemSlot,itemTexture = GetItemInfo(id)
+		_,_,id = string.find(itemLink,"(item:%d+:%d+:%-?%d+:%-?%d+)")
+		if not id then
+			-- unusual link (fewer fields): rebuild a 4 field item string from the item number so GetItemInfo never gets nil
+			local _,_,num = string.find(itemLink,"item:(%d+)")
+			id = num and ("item:"..num..":0:0:0") or nil
+		end
+		_,_,itemID = string.find(id or "","item:(%d+:%d+:%-?%d+):%-?%d+")
+		if id then
+			itemName,_,_,_,_,_,_,itemSlot,itemTexture = GetItemInfo(id)
+		end
+		if not itemName then
+			-- item not in the client cache yet: the name written in the link is still right (was nil before => item "not found")
+			_,_,itemName = string.find(itemLink,"%[(.+)%]")
+		end
 	elseif not slot then -- if no link and this is an inventory slot, missing or ammo
 		_,itemTexture = GetInventorySlotInfo(Rack.SlotInfo[bag].name) -- get paperdoll texture
 		itemID = 0 -- assume empty slot
@@ -4094,80 +4135,162 @@ function Rack.ClearLockList(bag,slot)
 	end
 end
 
--- returns inv,bag,slot of an itemID, or itemName if itemID doesn't exist
-function Rack.FindItem(itemID,itemName,passive)
-
-	local bagStart,bagEnd,i,j,id,name = 0,4
-	local inv,bag,slot
-
-	if itemID then
-
-		for i=bagStart,bagEnd do -- check bags for itemID
-			for j=1,GetContainerNumSlots(i) do
-				if not Rack.LockList[i][j] or passive then
-					_,id = Rack.GetItemInfo(i,j)
-					if id==itemID then
-						bag,slot = i,j
-						i,j = 99,99
-					end
-				end
-			end
-		end
-
-		if not bag then
-			for i=0,19 do -- if not in bags, check on person for itemID
-				if not Rack.LockList[-2][i] or passive then
-					_,id = Rack.GetItemInfo(i)
-					if id==itemID then
-						inv = i
-						i = 99
-					end
-				end
-			end
-		end
+-- splits an item id string "ITEMID:ENCHANT:SUFFIX" into three strings (nil for the empty-slot id 0 or bad input)
+function Rack.SplitID(itemID)
+	if type(itemID)=="string" then
+		local _,_,base,enchant,suffix = string.find(itemID,"^(%d+):(%d+):(%-?%d+)")
+		return base,enchant,suffix
 	end
-
-	-- if an exact itemID match wasn't found, search by name
-	if not inv and not bag and not slot then
-		itemName = itemName or Rack.GetNameByID(itemID)
-		if itemName then
-
-			for i=bagStart,bagEnd do -- check bags for itemID
-				for j=1,GetContainerNumSlots(i) do
-					if not Rack.LockList[i][j] or passive then
-						_,_,name = Rack.GetItemInfo(i,j)
-						if name==itemName then
-							bag,slot = i,j
-							i,j = 99,99
-						end
-					end
-				end
-			end
-
-			if not bag then
-				for i=0,19 do -- check on person for itemName
-					if not Rack.LockList[-2][i] or passive then
-						_,_,name = Rack.GetItemInfo(i)
-						if name==itemName then
-							inv = i
-							i = 99
-						end
-					end
-				end
-			end
-		end
-	end
-
-	return inv,bag,slot
 end
 
--- performs a FindItem on a set entry ([0]-[19]) and updates itemid if one wasn't there
-function Rack.FindSetItem(setslot)
-	local inv,bag,slot = Rack.FindItem(setslot.id,setslot.name)
-	if not setslot.id and setslot.name and (inv or bag or slot) then
-		setslot.id = Rack.GetItemID(setslot.name)
+-- true if two item ids are the same item. The ENCHANT part is ignored on purpose: the player re-enchants gear all the
+-- time and each re-enchant changes the id, which used to make ItemRack lose the item (it was only found again by name).
+-- The random suffix (of the Bear...) is kept: that really is another item.
+function Rack.SameItem(id1,id2)
+	if id1==nil or id2==nil then
+		return false
+	elseif id1==id2 then
+		return true
 	end
-	return inv,bag,slot
+	local base1,_,suffix1 = Rack.SplitID(id1)
+	local base2,_,suffix2 = Rack.SplitID(id2)
+	return base1~=nil and base1==base2 and suffix1==suffix2
+end
+
+-- id "ITEMID:ENCHANT:SUFFIX" of the item in container(bag,slot) or worn in inventory slot 'bag' (slot=nil), straight from
+-- the link: no GetItemInfo call, so scanning every slot for an id is cheap
+function Rack.GetItemIDOnly(bag,slot)
+	local link,id,num
+	if slot then
+		link = GetContainerItemLink(bag,slot)
+	else
+		link = GetInventoryItemLink("player",bag)
+	end
+	if link then
+		_,_,id = string.find(link,"item:(%d+:%d+:%-?%d+):%-?%d+")
+		if not id then
+			_,_,num = string.find(link,"item:(%d+)")
+			id = num and (num..":0:0") or nil
+		end
+	end
+	return id
+end
+
+-- is (id,name) a match for the wanted item at this tier?  tier 1 = same id, 2 = same item (enchant may differ), 3 = same name
+function Rack.MatchTier(tier,itemID,itemName,id,name)
+	if tier==1 then
+		return id~=nil and id==itemID
+	elseif tier==2 then
+		return Rack.SameItem(id,itemID)
+	end
+	return name~=nil and name==itemName
+end
+
+-- first slot of container 'bag' (bags 0-4, bank -1 and 5-10) holding an item that matches at this tier, nil if none.
+-- slots in Rack.LockList are skipped unless passive
+function Rack.FindInBag(bag,tier,itemID,itemName,passive)
+	local j,id,name
+	local locks = Rack.LockList[bag]
+	for j=1,GetContainerNumSlots(bag) do
+		if passive or not (locks and locks[j]) then
+			if tier<3 then
+				id = Rack.GetItemIDOnly(bag,j)
+			else
+				_,id,name = Rack.GetItemInfo(bag,j)
+			end
+			if Rack.MatchTier(tier,itemID,itemName,id,name) then
+				return j
+			end
+		end
+	end
+end
+
+-- first worn slot (0-19) holding an item that matches at this tier, nil if none (skipInv = slot to ignore)
+function Rack.FindOnPerson(tier,itemID,itemName,passive,skipInv)
+	local i,id,name
+	for i=0,19 do
+		if i~=skipInv and (passive or not Rack.LockList[-2][i]) then
+			if tier<3 then
+				id = Rack.GetItemIDOnly(i)
+			else
+				_,id,name = Rack.GetItemInfo(i)
+			end
+			if Rack.MatchTier(tier,itemID,itemName,id,name) then
+				return i
+			end
+		end
+	end
+end
+
+-- first bank slot (only while the bank is open) holding a matching item: returns bag,slot
+function Rack.FindInBank(tier,itemID,itemName,passive)
+	local i,bag,slot
+	if ItemRack.BankIsOpen then
+		for i=1,table.getn(ItemRack.BankSlots) do
+			bag = ItemRack.BankSlots[i]
+			slot = Rack.FindInBag(bag,tier,itemID,itemName,passive)
+			if slot then
+				return bag,slot
+			end
+		end
+	end
+end
+
+-- returns inv,bag,slot,tier of an itemID, falling back on the same item with another enchant, then on itemName.
+-- Order of preference: exact id, same item/other enchant, same name; for each: bags, worn items, bank (bank only if
+-- withBank and the bank is open, bank slots come back as a bag number -1 or 5-10).
+-- passive = ignore Rack.LockList; skipInv = a worn slot that must not be returned; maxTier = stop after that tier
+function Rack.FindItem(itemID,itemName,passive,withBank,skipInv,maxTier)
+
+	local tier,bag,slot,inv,b
+	local hasId = (type(itemID)=="string")
+
+	for tier=1,(maxTier or 3) do
+		if tier==3 and not itemName and hasId then
+			itemName = Rack.GetNameByID(itemID)
+		end
+		if (tier<3 and hasId) or (tier==3 and itemName and itemName~="(empty)") then
+			for b=0,4 do -- bags
+				slot = Rack.FindInBag(b,tier,itemID,itemName,passive)
+				if slot then
+					return nil,b,slot,tier
+				end
+			end
+			inv = Rack.FindOnPerson(tier,itemID,itemName,passive,skipInv) -- on the character
+			if inv then
+				return inv,nil,nil,tier
+			end
+			if withBank then
+				bag,slot = Rack.FindInBank(tier,itemID,itemName,passive)
+				if bag then
+					return nil,bag,slot,tier
+				end
+			end
+		end
+	end
+end
+
+-- performs a FindItem on a set entry ([0]-[19]). Also keeps the entry up to date:
+-- an entry saved without id learns it, an item found with another enchant updates the enchant in the entry
+-- (skipInv = the worn slot being filled: never "find" the item being replaced)
+function Rack.FindSetItem(setslot,skipInv)
+	local inv,bag,slot,tier = Rack.FindItem(setslot.id,setslot.name,nil,1,skipInv)
+	local _,foundID
+	if inv then
+		_,foundID = Rack.GetItemInfo(inv)
+	elseif bag then
+		_,foundID = Rack.GetItemInfo(bag,slot)
+	end
+	if foundID and (not setslot.id or tier~=1) then
+		setslot.id = foundID
+	end
+	return inv,bag,slot,tier
+end
+
+-- true if a copy of exactly this id is available (bags, other worn slot, open bank) to be worn
+function Rack.HasExactCopy(itemID,skipInv,passive)
+	local inv,bag = Rack.FindItem(itemID,nil,passive,1,skipInv,1)
+	return (inv or bag) and true or nil
 end
 
 function Rack.InvToInvSwap(inv1,inv2)
@@ -4335,20 +4458,27 @@ end
 
 function Rack.EquipSet(setname)
 
-	local i,bag,slot,id,swap,idx
+	local i,bag,slot,id,swap,idx,inv,tier,sourceEquipSlot,destEquipSlot
 	local mustWait -- flag that this swap must happen in stages (INV needs to move out of the way)
 	local set = Rack_User[user].Sets[setname]
 	local hasTWOHAND, hasINVTOBAG, hasINVTOINV, hasBAGTOINV, hasAMMO
 	local missing = "ItemRack could not find: "
 	local invStart,invEnd = 1,19 -- changes to 16,18 if in combat
+	local ok = {} -- ok[i]=1 when the item wanted for slot i is already worn
+	local prevold = {} -- .old values as they were before this call (restored for slots that turn out not to change)
 
 	if not set then
 		DEFAULT_CHAT_FRAME:AddMessage("Rack: Set \""..setname.."\" doesn't exist.")
 		return
 	end
 
-	if Rack.IsSetEquipped(setname) then
-		if not string.find(setname,"^Rack-") and not string.find(setname,"^ItemRack") then
+	if not Rack.RetryCall then
+		-- a new request (key, menu, macro): forget the automatic retries of a previous attempt
+		Rack.RetryCount[setname] = nil
+	end
+
+	if Rack.IsSetEquipped(setname,1) then
+		if not string.find(setname,"^Rack%-") and not string.find(setname,"^ItemRack") then
 			Rack_User[user].CurrentSet = setname
 		end
 		Rack.StartTimer("InvUpdate")
@@ -4376,14 +4506,32 @@ function Rack.EquipSet(setname)
 		_,id = Rack.GetItemInfo(i)
 
 		if set[i] and (set[i].id or set[i].name) then
-			Rack.FindSetItem(set[i])
+			if not set[i].id then
+				Rack.FindSetItem(set[i]) -- old set saved without ids: learn the id of the item if it can be found
+			end
+			prevold[i] = set[i].old
 			if set[i].id==id then
 				Rack.LockList[-2][i] = 1
+				ok[i] = 1
 			else
 				set[i].old = id -- store what was there previously
 			end
 		end
 		Rack.ClearSwapListEntry(i)
+	end
+
+	-- second pre-scan: the same item worn with another enchant than the one saved in the set is still the right item,
+	-- unless a copy with exactly the saved enchant is lying around (then that copy is the one the set wants)
+	for i=0,19 do
+		if set[i] and set[i].id and not ok[i] then
+			_,id = Rack.GetItemInfo(i)
+			if Rack.SameItem(set[i].id,id) and not Rack.HasExactCopy(set[i].id,i) then
+				ok[i] = 1
+				Rack.LockList[-2][i] = 1
+				set[i].id = id -- the set now remembers the current enchant
+				set[i].old = prevold[i]
+			end
+		end
 	end
 
 	if UnitAffectingCombat("player") then -- player is in combat
@@ -4404,19 +4552,23 @@ function Rack.EquipSet(setname)
 
 	-- determine what needs swapped and populate Rack.SwapList
 	-- skipping ammo slot the black sheep of inventory slots
+	Rack.Planned[setname] = {}
 	for i=invStart,invEnd do
 		if set[i] and set[i].id then
 			_,id = Rack.GetItemInfo(i)
-			if id~=set[i].id then
+			if not ok[i] then
 				swap = Rack.SwapList[i]
 				swap.needsSwap = 1
-				swap.desiredName = Rack.GetNameByID(set[i].id)
+				swap.desiredName = Rack.GetNameByID(set[i].id) or set[i].name
 				if set[i].id==0 then -- empty slot
 					swap.direction="INVTOBAG"
 					swap.needsEmptied = 1
 					hasINVTOBAG = 1
 				else
-					inv,bag,slot = Rack.FindSetItem(set[i])
+					inv,bag,slot,tier = Rack.FindSetItem(set[i],i)
+					if inv or (bag and slot) then
+						Rack.Planned[setname][i] = 1 -- remember what we tried: checked when the swaps are over
+					end
 					if inv then -- found it in another inventory slot
 						Rack.LockList[-2][inv] = 1
 						_,_,_,sourceEquipSlot = Rack.GetItemInfo(inv)
@@ -4457,7 +4609,11 @@ function Rack.EquipSet(setname)
 	end
 
 	if missing~="ItemRack could not find: " then
-		DEFAULT_CHAT_FRAME:AddMessage(string.gsub(missing,", $",""))
+		DEFAULT_CHAT_FRAME:AddMessage((string.gsub(missing,", $","")))
+		if not ItemRack.BankIsOpen then
+			-- the bank can't be read while its window is closed
+			DEFAULT_CHAT_FRAME:AddMessage("ItemRack: items kept in the bank are only found while the bank window is open.")
+		end
 	end
 
 	-- at this stage, Rack.SwapList[0]-[19] is populated
@@ -4508,7 +4664,7 @@ function Rack.EquipSet(setname)
 	-- perform ammo swaps directly. since it never takes up a new bag slot it's ok to do pickups and move on
 	if set[0] and set[0].id then
 		_,id = Rack.GetItemInfo(0)
-		if id~=set[0].id then
+		if not Rack.SameItem(set[0].id,id) then
 			if set[0].id==0 then -- unequip ammo
 				bag,slot = Rack.FindSpace()
 				if bag then
@@ -4516,7 +4672,7 @@ function Rack.EquipSet(setname)
 					PickupContainerItem(bag,slot)
 				end
 			else
-				_,bag,slot = Rack.FindSetItem(set[0])
+				_,bag,slot = Rack.FindSetItem(set[0],0)
 				if bag then
 					PickupContainerItem(bag,slot)
 					PickupInventoryItem(0)
@@ -4532,6 +4688,13 @@ function Rack.EquipSet(setname)
 	end
 	if Rack_User[user].Sets[setname].showcloak then
 		ShowCloak(Rack_User[user].Sets[setname].showcloak)
+	end
+
+	if not hasINVTOBAG and not hasINVTOINV and not hasBAGTOINV and not Rack.SetSwapping and invStart==1
+	   and missing=="ItemRack could not find: " and not string.find(setname,"^Rack%-") and not string.find(setname,"^ItemRack") then
+		-- nothing to move: everything wanted is already worn (some with another enchant), the set is the current set
+		Rack_User[user].CurrentSet = setname
+		Rack.StartTimer("InvUpdate")
 	end
 
 	-- at last, perform the swaps by iterating over the queue
@@ -4551,10 +4714,94 @@ function Rack.IterateWait()
 end
 
 function Rack.ShutdownQueue()
+	local idx
 	RackFrame:UnregisterEvent("ITEM_LOCK_CHANGED")
 	Rack.SetSwapping = nil
-	for i=1,table.getn(Rack.SwapQueueOrder) do
-		Rack.RemoveQueueEntry(Rack.SwapQueueOrder[i])
+	Rack.StopTimer("SwapWatchdog")
+	-- empty the WHOLE queue. The old loop removed entries while counting forward, skipped every other one and left stale
+	-- swaps of the abandoned set in the queue (they were replayed by the next set: "wrong item equipped")
+	while Rack.SwapQueueOrder[1] do
+		idx = Rack.SwapQueueOrder[1]
+		table.remove(Rack.SwapQueueOrder,1)
+		Rack.ClearQueueEntry(idx)
+	end
+end
+
+-- the head entry of the queue is finished: drop it, check the set if that was its last entry, go on with the next one
+-- markCurrent = true when the swaps really happened (the set becomes the current set)
+function Rack.QueueEntryDone(markCurrent)
+	local idx = Rack.SwapQueueOrder[1]
+	local setname,nextIdx
+	if not idx then
+		return
+	end
+	setname = Rack.SwapQueue[idx].setname
+	if markCurrent and setname and not string.find(setname,"^Rack%-") and not string.find(setname,"^ItemRack") then
+		Rack_User[user].CurrentSet = setname
+	end
+	Rack.RemoveQueueEntry(idx)
+	nextIdx = Rack.SwapQueueOrder[1]
+	if setname and (not nextIdx or Rack.SwapQueue[nextIdx].setname~=setname) then
+		Rack.FinishSet(setname)
+	end
+	Rack.IterateSwapQueue()
+end
+
+-- called when the last swap of a set is over: makes sure the set really is worn and retries what failed (twice at most).
+-- Server latency, a locked item or two moves stepping on each other used to leave a half equipped set with no message
+function Rack.FinishSet(setname)
+	local set = Rack_User[user].Sets[setname]
+	local planned = Rack.Planned[setname]
+	local i,id,bad,tries,_
+	if not set or not planned or UnitAffectingCombat("player") or Rack.IsPlayerReallyDead() or Rack.SwapQueueOrder[1] then
+		return -- (another set already waits its turn: what the player asked last wins, don't check this one)
+	end
+	for i=0,19 do
+		if planned[i] and set[i] and set[i].id then
+			_,id = Rack.GetItemInfo(i)
+			if not Rack.SameItem(set[i].id,id) then
+				bad = (bad and (bad..", ") or "")..tostring(Rack.GetNameByID(set[i].id) or set[i].name)
+			end
+		end
+	end
+	Rack.Planned[setname] = nil
+	if bad then
+		tries = (Rack.RetryCount[setname] or 0) + 1
+		Rack.RetryCount[setname] = tries
+		if tries<=2 then
+			Rack.StartTimer("RetrySet",.6,setname)
+		else
+			Rack.RetryCount[setname] = nil
+			DEFAULT_CHAT_FRAME:AddMessage("ItemRack: could not equip: "..bad)
+		end
+	else
+		Rack.RetryCount[setname] = nil
+	end
+end
+
+-- timer function: second (third) attempt for the slots FinishSet found wrong
+function Rack.RetrySet(setname)
+	-- only if the player did not ask for another set in the meantime
+	if setname and Rack_User[user].Sets[setname] and not Rack.SetSwapping and Rack.CurrentSet()==setname then
+		Rack.RetryCall = 1
+		Rack.EquipSet(setname)
+		Rack.RetryCall = nil
+	end
+end
+
+-- safety net: the queue normally advances on ITEM_LOCK_CHANGED. If an entry moved nothing or the event never comes,
+-- the old code stayed "swapping" for ever and every following set was queued behind it. Checked every 1.5 seconds.
+function Rack.SwapWatchdog()
+	if not Rack.SetSwapping or not Rack.SwapQueueOrder[1] then
+		Rack.StopTimer("SwapWatchdog")
+	elseif Rack.AnyLocked() then
+		Rack.WatchdogCount = (Rack.WatchdogCount or 0) + 1
+		if Rack.WatchdogCount>20 then -- about 30 seconds with an item still locked: something is badly wrong
+			DEFAULT_CHAT_FRAME:AddMessage("ItemRack: the swap takes too long (an item stays locked), giving up on it.")
+			Rack.ShutdownQueue()
+		end
+	else
+		Rack.OnItemLockChanged() -- nothing is locked any more: this entry is over
 	end
 end
 
@@ -4567,8 +4814,9 @@ function Rack.IterateSwapQueue()
 		-- if queue is empty, unregister and leave
 		Rack.SetSwapping = nil
 		RackFrame:UnregisterEvent("ITEM_LOCK_CHANGED")
+		Rack.StopTimer("SwapWatchdog")
 		return
-	
+
 	elseif SpellIsTargeting() or CursorHasItem() then
 		-- check if in Spell Targeting mode to prevent disenchants/enchants
 		Rack.StartTimer("WaitToIterate")
@@ -4585,6 +4833,7 @@ function Rack.IterateSwapQueue()
 		local bag,slot,id
 		local idx = Rack.SwapQueueOrder[1]
 		local queue = Rack.SwapQueue[idx]
+		local issued = 0 -- number of pickups pairs really sent
 
 		if queue.direction == "NEWSET" then
 			Rack.SetSwapping = nil
@@ -4611,6 +4860,7 @@ function Rack.IterateSwapQueue()
 							queue[i].fromSlot = slot
 							PickupInventoryItem(i)
 							PickupContainerItem(bag,slot)
+							issued = issued + 1
 						else
 							Rack.NoMoreRoom()
 							queue[i].id = nil
@@ -4625,23 +4875,28 @@ function Rack.IterateSwapQueue()
 					if queue[i].fromSlot then
 						PickupInventoryItem(queue[i].fromSlot)
 						PickupInventoryItem(i)
+						issued = issued + 1
 					end
 				end
 			elseif queue.direction == "BAGTOINV" then
 				for i=0,19 do
 					if queue[i].fromBag then
 						_,id = Rack.GetItemInfo(queue[i].fromBag,queue[i].fromSlot)
-						if id == queue[i].id then
+						if Rack.SameItem(id,queue[i].id) and not Rack.LockList[queue[i].fromBag][queue[i].fromSlot] then
+							Rack.LockList[queue[i].fromBag][queue[i].fromSlot] = 1 -- two entries never take the same slot
 							PickupContainerItem(queue[i].fromBag,queue[i].fromSlot)
 							PickupInventoryItem(i)
+							issued = issued + 1
 						else
 							-- didn't find it at same bag spot when queued
 							_,bag,slot = Rack.FindSetItem(queue[i])
 							if bag then
 								queue[i].fromBag = bag
 								queue[i].fromSlot = slot
+								Rack.LockList[bag][slot] = 1
 								PickupContainerItem(bag,slot)
 								PickupInventoryItem(i)
+								issued = issued + 1
 							else
 								queue[i].id = nil -- forget we tried
 								queue[i].fromBag = nil
@@ -4649,6 +4904,17 @@ function Rack.IterateSwapQueue()
 							end
 						end
 					end
+				end
+			end
+
+			if Rack.SwapQueueOrder[1]==idx then -- (not shut down in the meantime)
+				if issued>0 then
+					Rack.WatchdogCount = 0
+					Rack.StartTimer("SwapWatchdog")
+				else
+					-- nothing could be moved (the item vanished, ...): no ITEM_LOCK_CHANGED will ever come for this entry,
+					-- so go on right now instead of staying "swapping" for ever
+					Rack.QueueEntryDone(nil)
 				end
 			end
 		end
@@ -4706,7 +4972,7 @@ end
 -- returns true if anything is locked
 function Rack.AnyLocked()
 
-	local locked,isLocked
+	local locked,isLocked,b
 
 	for i=0,19 do
 		if IsInventoryItemLocked(i) then
@@ -4727,6 +4993,20 @@ function Rack.AnyLocked()
 		end
 	end
 
+	if not locked and ItemRack.BankIsOpen then
+		-- a set can be equipped from the bank: its slots lock too
+		for k=1,table.getn(ItemRack.BankSlots) do
+			b = ItemRack.BankSlots[k]
+			for j=1,GetContainerNumSlots(b) do
+				_,_,isLocked = GetContainerItemInfo(b,j)
+				if isLocked then
+					locked = 1
+					k,j = 99,99
+				end
+			end
+		end
+	end
+
 	return locked
 end
 
@@ -4738,17 +5018,18 @@ function Rack.OnItemLockChanged()
 	if not Rack.SwapQueueOrder[1] then
 		Rack.SetSwapping = nil
 		RackFrame:UnregisterEvent("ITEM_LOCK_CHANGED")
+		Rack.StopTimer("SwapWatchdog")
 		return
 	end
 
-	if not Rack.AnyLocked() then
-		local setname = Rack.SwapQueue[Rack.SwapQueueOrder[1]].setname
-		if not string.find(setname,"^Rack-") and not string.find(setname,"^ItemRack") then
-			Rack_User[user].CurrentSet = setname
-		end
-		Rack.RemoveQueueEntry(Rack.SwapQueueOrder[1])
+	Rack.WatchdogCount = 0 -- the items are moving, nothing is stuck
+
+	if Rack.SwapQueue[Rack.SwapQueueOrder[1]].direction=="NEWSET" then
+		-- a set waiting its turn is never "finished" by a lock event
 		Rack.IterateSwapQueue()
-	end	
+	elseif not Rack.AnyLocked() then
+		Rack.QueueEntryDone(1)
+	end
 end
 
 --[[ Combat/Death Queue Processing ]]
@@ -4772,7 +5053,7 @@ function Rack.AddToCombatQueue(slot,id)
 	local button = getglobal("ItemRackInv"..slot.."Queue")
 	local paperdoll = getglobal(ItemRack.Indexes[slot].paperdoll_slot.."Queue")
 	local _,wornId = Rack.GetItemInfo(slot)
-	if Rack.CombatQueue[slot]==id or id==wornId then
+	if Rack.CombatQueue[slot]==id or id==wornId or Rack.SameItem(id,wornId) then
 		Rack.CombatQueue[slot] = nil
 		button:Hide()
 		paperdoll:Hide()
@@ -4789,7 +5070,9 @@ end
 --[[ EquipSet wrappers ]]--
 
 -- returns true if the entire set is currently worn
-function Rack.IsSetEquipped(setname)
+-- the same item with another enchant counts as worn (the enchant in the saved id goes stale when the player re-enchants).
+-- careful = also require that no copy with exactly the saved id is available (used before deciding not to swap anything)
+function Rack.IsSetEquipped(setname,careful)
 
 	local set,missing,id = Rack_User[user].Sets[setname or ""]
 
@@ -4803,7 +5086,9 @@ function Rack.IsSetEquipped(setname)
 					_,id = Rack.GetItemInfo(i)
 				end
 				if set[i].id ~= id then
-					missing = 1
+					if not Rack.SameItem(set[i].id,id) or (careful and Rack.HasExactCopy(set[i].id,i,1)) then
+						missing = 1
+					end
 				end
 			end
 		end
@@ -5020,17 +5305,38 @@ end
 
 --[[ Bank support ]]
 
+-- is this container a bank container (-1 = the 24 bank slots, 5-10 = bank bags)?
+function Rack.IsBankBag(bag)
+	return bag~=nil and (bag==-1 or bag>=5)
+end
+
+-- the key used to look an item up regardless of its enchant: "ITEMID:SUFFIX"
+function Rack.SameKey(itemID)
+	local base,_,suffix = Rack.SplitID(itemID)
+	if base then
+		return base..":"..suffix
+	end
+end
+
+-- reads the open bank. BankedItems[name], BankedIDs[exact id] and BankedSame["ITEMID:SUFFIX"] hold the number of copies
+-- (names alone are not enough: two copies, or one item enchanted differently, share a name)
 function Rack.PopulateBank()
 	Rack.UnpopulateBank()
-	local itemLink,itemID,itemName,equipLoc
+	local itemID,itemName,equipLoc,bag,j,key
 	for i=1,table.getn(ItemRack.BankSlots) do
-		for j=1,GetContainerNumSlots(ItemRack.BankSlots[i]) do
-			itemLink = GetContainerItemLink(ItemRack.BankSlots[i],j) or ""
-			_,_,itemID = string.find(itemLink,"item:(%d+)")
+		bag = ItemRack.BankSlots[i]
+		for j=1,GetContainerNumSlots(bag) do
+			_,itemID,itemName,equipLoc = Rack.GetItemInfo(bag,j)
 			if itemID then
-				itemName,_,_,_,_,_,_,equipLoc = GetItemInfo(itemID)
-				if equipLoc and equipLoc~="" then
-					ItemRack.BankedItems[itemName] = 1
+				if not equipLoc or equipLoc~="" then -- wearable (or not in the client cache yet)
+					if itemName then
+						ItemRack.BankedItems[itemName] = (ItemRack.BankedItems[itemName] or 0) + 1
+					end
+					ItemRack.BankedIDs[itemID] = (ItemRack.BankedIDs[itemID] or 0) + 1
+					key = Rack.SameKey(itemID)
+					if key then
+						ItemRack.BankedSame[key] = (ItemRack.BankedSame[key] or 0) + 1
+					end
 				end
 			end
 		end
@@ -5041,12 +5347,20 @@ function Rack.UnpopulateBank()
 	for i in ItemRack.BankedItems do
 		ItemRack.BankedItems[i] = nil
 	end
+	for i in ItemRack.BankedIDs do
+		ItemRack.BankedIDs[i] = nil
+	end
+	for i in ItemRack.BankedSame do
+		ItemRack.BankedSame[i] = nil
+	end
 end
 
 function Rack.BankOpened()
-	Rack.PopulateBank()
 	ItemRack.BankIsOpen = 1
+	Rack.PopulateBank()
 	ItemRackFrame:RegisterEvent("BAG_UPDATE")
+	-- moves inside the 24 main bank slots only fire this one, not BAG_UPDATE: the list went stale after deposits/withdrawals
+	ItemRackFrame:RegisterEvent("PLAYERBANKSLOTS_CHANGED")
 end
 
 function Rack.BankClosed()
@@ -5054,24 +5368,40 @@ function Rack.BankClosed()
 	ItemRack_MenuFrame:Hide()
 	Rack.UnpopulateBank()
 	ItemRackFrame:UnregisterEvent("BAG_UPDATE")
+	ItemRackFrame:UnregisterEvent("PLAYERBANKSLOTS_CHANGED")
+	Rack.ClearLockList()
+end
+
+-- is the item of a set entry in the bank (by id first, then same item with another enchant, then by name)?
+function Rack.IsBanked(item)
+	if not item then
+		return nil
+	elseif item.id and item.id~=0 then
+		return ItemRack.BankedIDs[item.id] or ItemRack.BankedSame[Rack.SameKey(item.id) or ""]
+	elseif item.name and item.name~="(empty)" then
+		return ItemRack.BankedItems[item.name]
+	end
 end
 
 function Rack.SetHasBanked(setname)
 	if not setname or not Rack_User[user].Sets[setname] then return end
-	local name,item
 	for i=0,19 do
-		item = Rack_User[user].Sets[setname][i]
-		if item and item.name and ItemRack.BankedItems[item.name] then
+		if Rack.IsBanked(Rack_User[user].Sets[setname][i]) then
 			return 1
 		end
 	end
 end
 
-function Rack.FindBankedItem(name)
-	for _,i in ItemRack.BankSlots do
-		for j=1,GetContainerNumSlots(i) do
-			if strfind(GetContainerItemLink(i,j) or "",name,1,1) then
-				return i,j
+-- finds an item in the open bank: returns bag,slot. Bank slots in Rack.LockList are skipped, so asking twice for
+-- two copies of one item gives two different slots (it used to return the same slot twice and the second copy stayed behind)
+function Rack.FindBankedItem(itemID,itemName)
+	local tier,bag,slot
+	local hasId = (type(itemID)=="string")
+	for tier=1,3 do
+		if (tier<3 and hasId) or (tier==3 and itemName and itemName~="(empty)") then
+			bag,slot = Rack.FindInBank(tier,itemID,itemName)
+			if bag then
+				return bag,slot
 			end
 		end
 	end
@@ -5081,12 +5411,20 @@ function Rack.PullSetFromBank(setname)
 	Rack.ClearLockList()
 	local set = Rack_User[user].Sets[setname]
 	if not set or SpellIsTargeting() or CursorHasItem() then return end
-	local bag,slot,freeBag,freeSlot
+	local item,inv,bag,slot,freeBag,freeSlot
 	for i=0,19 do
-		if set[i] then
-			if ItemRack.BankedItems[set[i].name] then
-				bag,slot = Rack.FindBankedItem(set[i].name)
+		item = set[i]
+		if item and item.id~=0 and (item.id or item.name) then
+			-- already carried or worn? then leave the bank alone (and reserve that copy for this slot)
+			inv,bag,slot = Rack.FindItem(item.id,item.name)
+			if inv then
+				Rack.LockList[-2][inv] = 1
+			elseif bag then
+				Rack.LockList[bag][slot] = 1
+			else
+				bag,slot = Rack.FindBankedItem(item.id,item.name)
 				if bag then
+					Rack.LockList[bag][slot] = 1
 					freeBag,freeSlot = Rack.FindSpace()
 					if freeBag then
 						PickupContainerItem(bag,slot)
@@ -5105,25 +5443,59 @@ function Rack.PushSetToBank(setname)
 	Rack.ClearLockList()
 	local set = Rack_User[user].Sets[setname]
 	if not set or SpellIsTargeting() or CursorHasItem() then return end
-	local bag,slot,freeBag,freeSlot
+	local item,inv,bag,slot,freeBag,freeSlot
+	local worn = 0
 	for i=0,19 do
-		if set[i] then
-			freeBag,freeSlot = Rack.FindSpace(1)
-			if freeBag then
-				inv,bag,slot = Rack.FindItem(set[i].id,set[i].name)
-				if inv then
-					PickupInventoryItem(inv)
-					PickupContainerItem(freeBag,freeSlot)
-				elseif bag then
+		item = set[i]
+		if item and item.id~=0 and (item.id or item.name) then
+			inv,bag,slot = Rack.FindItem(item.id,item.name)
+			if inv then
+				-- worn: leave it on the character (this used to strip the equipment into the bank)
+				Rack.LockList[-2][inv] = 1
+				worn = worn + 1
+			elseif bag then
+				Rack.LockList[bag][slot] = 1
+				freeBag,freeSlot = Rack.FindSpace(1)
+				if freeBag then
 					PickupContainerItem(bag,slot)
 					PickupContainerItem(freeBag,freeSlot)
+				else
+					Rack.NoMoreRoom()
+					return
 				end
-			else
-				Rack.NoMoreRoom()
-				return
 			end
 		end
 	end
+	if worn>0 then
+		DEFAULT_CHAT_FRAME:AddMessage("ItemRack: "..worn.." equipped item(s) of the set stay on your character.")
+	end
+end
+
+-- the menu is built when the mouse enters the bar but bags can change before the click (loot, another swap, bank).
+-- true if bag,slot of menu entry idx still holds the item it names; if the item moved it is found again by name
+function Rack.CheckMenuItem(idx)
+	local entry = ItemRack.BaggedItems[idx]
+	local _,curName,b,slot
+	local first,last = 0,4
+	if not entry or not entry.bag then
+		return true -- the "(empty)" entry or a set: nothing to check
+	end
+	_,_,curName = Rack.GetItemInfo(entry.bag,entry.slot)
+	if curName==entry.name then
+		return true
+	end
+	if ItemRack.BankIsOpen then
+		first,last = -1,10
+	end
+	for b=first,last do
+		slot = Rack.FindInBag(b,3,nil,entry.name,1)
+		if slot then
+			entry.bag = b
+			entry.slot = slot
+			return true
+		end
+	end
+	return false
 end
 
 function Rack.NoMoreRoom()
